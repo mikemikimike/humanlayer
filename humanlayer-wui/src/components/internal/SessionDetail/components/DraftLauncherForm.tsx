@@ -18,6 +18,7 @@ import { daemonClient } from '@/lib/daemon'
 import { type Session, ViewMode } from '@/lib/daemon/types'
 import { logger } from '@/lib/logging'
 import { formatError } from '@/utils/errors'
+import { runWithLaunchCleanup } from './draftLaunchCleanup'
 import { DangerouslySkipPermissionsDialog } from '../DangerouslySkipPermissionsDialog'
 import { DiscardDraftDialog } from './DiscardDraftDialog'
 import { CreateDirectoryDialog } from './CreateDirectoryDialog'
@@ -469,79 +470,82 @@ export const DraftLauncherForm: React.FC<DraftLauncherFormProps> = ({ session, o
         return
       }
 
-      try {
-        setIsLaunchingDraft(true)
+      setIsLaunchingDraft(true)
+      await runWithLaunchCleanup(
+        async () => {
+          try {
+            // Prepare update payload with all necessary settings
+            const updatePayload: any = {
+              autoAcceptEdits: settings.autoAcceptEdits,
+              dangerouslySkipPermissions: settings.dangerouslySkipPermissions,
+              dangerouslySkipPermissionsTimeoutMs: savedBypassTimeout
+                ? savedBypassTimeout * 60 * 1000
+                : undefined, // Convert minutes to milliseconds
+            }
 
-        // Prepare update payload with all necessary settings
-        const updatePayload: any = {
-          autoAcceptEdits: settings.autoAcceptEdits,
-          dangerouslySkipPermissions: settings.dangerouslySkipPermissions,
-          dangerouslySkipPermissionsTimeoutMs: savedBypassTimeout
-            ? savedBypassTimeout * 60 * 1000
-            : undefined, // Convert minutes to milliseconds
-        }
+            // If using Baseten, include the API key from localStorage
+            if (proxyEnabled && proxyBaseUrl && proxyBaseUrl.includes('baseten.co')) {
+              const basetenApiKey = localStorage.getItem('humanlayer-baseten-api-key')
+              if (basetenApiKey) {
+                updatePayload.proxyApiKey = basetenApiKey
+              }
+            }
 
-        // If using Baseten, include the API key from localStorage
-        if (proxyEnabled && proxyBaseUrl && proxyBaseUrl.includes('baseten.co')) {
-          const basetenApiKey = localStorage.getItem('humanlayer-baseten-api-key')
-          if (basetenApiKey) {
-            updatePayload.proxyApiKey = basetenApiKey
+            // If using OpenRouter, include the API key from localStorage
+            if (proxyEnabled && proxyBaseUrl && proxyBaseUrl.includes('openrouter.ai')) {
+              const openrouterApiKey = localStorage.getItem('humanlayer-openrouter-api-key')
+              if (openrouterApiKey) {
+                updatePayload.proxyApiKey = openrouterApiKey
+              }
+            }
+
+            // Apply the settings to the draft session before launching
+            await daemonClient.updateSession(sessionId, updatePayload)
+
+            // Launch the draft session with the prompt
+            await daemonClient.launchDraftSession(sessionId, currentPrompt, createDirectoryIfNotExists)
+
+            // Track session creation event (from draft)
+            trackEvent(POSTHOG_EVENTS.SESSION_CREATED, {
+              model: model || proxyModelOverride || undefined,
+              provider: proxyEnabled
+                ? proxyBaseUrl?.includes('baseten')
+                  ? 'baseten'
+                  : 'openrouter'
+                : 'anthropic',
+              from_draft: true,
+            })
+
+            // Store working directory in localStorage
+            localStorage.setItem('humanlayer-last-working-dir', workingDir)
+
+            // Clear the input after successful launch
+            storeState.responseEditor?.commands.setContent('')
+            localStorage.removeItem(`response-input.${sessionId}`)
+
+            // Refresh sessions to update the session list, set view mode to 'normal'
+            await storeState.refreshSessions()
+            await storeState.setViewMode(ViewMode.Normal)
+
+            // Navigate directly to the launched session
+            navigate(`/sessions/${sessionId}`)
+          } catch (error: any) {
+            // Check if it's a 422 directory not found error
+            if (error.status === 422 && error.data?.error === 'directory_not_found') {
+              setDirectoryToCreate(error.data.path)
+              setShowCreateDirectoryDialog(true)
+              return // Don't show error toast, let user decide via dialog
+            }
+
+            // Other errors
+            toast.error('Failed to launch draft session', {
+              description: await formatError(error),
+            })
           }
-        }
-
-        // If using OpenRouter, include the API key from localStorage
-        if (proxyEnabled && proxyBaseUrl && proxyBaseUrl.includes('openrouter.ai')) {
-          const openrouterApiKey = localStorage.getItem('humanlayer-openrouter-api-key')
-          if (openrouterApiKey) {
-            updatePayload.proxyApiKey = openrouterApiKey
-          }
-        }
-
-        // Apply the settings to the draft session before launching
-        await daemonClient.updateSession(sessionId, updatePayload)
-
-        // Launch the draft session with the prompt
-        await daemonClient.launchDraftSession(sessionId, currentPrompt, createDirectoryIfNotExists)
-
-        // Track session creation event (from draft)
-        trackEvent(POSTHOG_EVENTS.SESSION_CREATED, {
-          model: model || proxyModelOverride || undefined,
-          provider: proxyEnabled
-            ? proxyBaseUrl?.includes('baseten')
-              ? 'baseten'
-              : 'openrouter'
-            : 'anthropic',
-          from_draft: true,
-        })
-
-        // Store working directory in localStorage
-        localStorage.setItem('humanlayer-last-working-dir', workingDir)
-
-        // Clear the input after successful launch
-        storeState.responseEditor?.commands.setContent('')
-        localStorage.removeItem(`response-input.${sessionId}`)
-
-        // Refresh sessions to update the session list, set view mode to 'normal'
-        await storeState.refreshSessions()
-        await storeState.setViewMode(ViewMode.Normal)
-
-        // Navigate directly to the launched session
-        navigate(`/sessions/${sessionId}`)
-      } catch (error: any) {
-        // Check if it's a 422 directory not found error
-        if (error.status === 422 && error.data?.error === 'directory_not_found') {
-          setDirectoryToCreate(error.data.path)
-          setShowCreateDirectoryDialog(true)
-          setIsLaunchingDraft(false)
-          return // Don't show error toast, let user decide via dialog
-        }
-
-        // Other errors
-        toast.error('Failed to launch draft session', {
-          description: await formatError(error),
-        })
-        setIsLaunchingDraft(false)
-      }
+        },
+        // Always unlock the launcher so a failed task can be retried or discarded.
+        () => setIsLaunchingDraft(false),
+      )
     },
     [
       sessionId,
